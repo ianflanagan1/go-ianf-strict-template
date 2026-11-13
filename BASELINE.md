@@ -9,69 +9,75 @@ The rules this project shares with every Go project built on go-baseline. The li
 - Run `devbox run -- task check` before finishing a change. It must pass.
 - Don't edit `.golangci.yml`, `Taskfile.yml` or this file; `verify` fails if they differ from the baseline. Put the project's own tasks in `Taskfile.project.yml`, which `Taskfile.yml` includes. A rule that's wrong for every project changes in go-baseline.
 - Don't silence a linter with `//nolint`. Restructure the code so the rule holds.
+- When a rule makes the task impossible, or rules out the solution that's clearly best, stop and ask the user to change the baseline. Say which rule, what it blocks and the change to go-baseline you'd suggest. Do the same when a check is wrong about your code. Don't contort the code to get past the check, and don't loosen the rules yourself: no editing the generated files, and no older version or `replace` of go-baseline in `go.mod`. A person changes go-baseline and releases it, and the project upgrades.
 - Run `devbox run -- go mod tidy` after changing dependencies. `verify` fails when `go.mod` is untidy, or when the code calls a function with a known vulnerability; upgrade the dependency to fix one.
+- In a module with a program in `cmd/`, `verify` reports each function under `cmd/` or `internal/` that no program calls, even indirectly. A function only tests call is unreachable too. Delete code nothing runs.
 - Run tools through devbox (`devbox run -- go ...`), so the pinned Go and golangci-lint are used.
-- Run `go tool go-baseline map` to see each package's role, the ports the shell declares and the adapters that implement them.
+- `GOTOOLCHAIN` in `devbox.json` pins the exact Go release, which Go downloads and checks against the checksum database. Never edit it or set `GOTOOLCHAIN` for one command: `go tool go-baseline write` sets it to the release the baseline approves, so a newer Go comes from upgrading go-baseline.
+- Run `go tool go-baseline map` to see each package's role, the ports the orchestrators declare and the driven adapters that implement them.
+- Tools keep their caches in `cache/`, which `.gitignore` ignores with the line `/cache/`; `verify` fails without it. Point a tool that caches inside the project at a directory under it, such as `cache/<tool>/`.
 
 ## Architecture: functional core, imperative shell
 
-Decisions live in pure code that takes values and returns values. Everything with side effects or non-determinism (files, network, databases, the environment, the clock, randomness, logging) happens in adapters, which implement ports: interfaces that the shell declares.
+Decisions live in pure code that takes values and returns values: the core. Everything else is the shell. Orchestrators run the use cases; everything with side effects or non-determinism (files, network, databases, the environment, the clock, randomness, logging) happens in driven adapters, which implement ports: interfaces that the orchestrators declare. Driving adapters, such as an HTTP server or a command line, turn calls from outside into calls to orchestrators. An entrypoint in `cmd/` builds them all and starts a driving adapter.
 
 A package's directory decides its role, and its role decides its rules:
 
 | Role | Directory | Does I/O | Tested with |
 |---|---|---|---|
-| Core | `internal/core/...`; in a pure library, every package | Never, even through a dependency | Table-driven tests over values. At least 80% statement coverage per package. |
-| Shell | Any other directory | Only through ports | Fakes that implement its ports |
-| Adapter | `internal/adapters/...`, or any package of an `adapters` module | Yes: that's its job | Integration tests against the real dependency or a local stand-in |
-| Composition root | `cmd/<name>` | Yes: reads configuration, builds adapters, passes them in | Kept small enough not to need tests |
+| Core | `internal/core/...`; in a library, `core/...` | Never, even through a dependency | Table-driven tests over values. At least 80% statement coverage per package. |
+| Orchestrator | `internal/orchestrators/...`; in a library, `orchestrators/...` | Only through ports | Fakes that implement its ports |
+| Driving adapter | `internal/adapters/driving/...`; in a library, `adapters/driving/...` | Yes: it serves the outside world, and calls orchestrators | Tests that drive it, with real orchestrators and fakes for their ports |
+| Driven adapter | `internal/adapters/driven/...`; in a library, `adapters/driven/...` | Yes: that's its job | Integration tests against the real dependency or a local stand-in |
+| Entrypoint | `cmd/<name>` | Yes: reads configuration, builds the adapters and orchestrators, starts a driving adapter | Kept small enough not to need tests |
 
-The module kind, recorded at the top of `.golangci.yml`, is one of:
+A package in none of these directories has no role, and `verify` reports it: one directly under `adapters/`, in neither `driving/` nor `driven/`, or one elsewhere, such as `internal/app`. Put each package in the directory of the role it plays.
 
-- `command`: builds programs from `cmd/`. Everything else is under `internal/`.
-- `pure-library`: imported by other modules and does no I/O. Every package is core, and it has no `adapters/` or `cmd/`. Other projects treat its packages as core too.
-- `adapters`: shared adapters, such as go-adapters, that other modules' composition roots and adapters import. Every package is an adapter, with an adapter's size limits.
+A role's directory holds its members, each orchestrator, driving adapter, driven adapter or entrypoint, and their helpers: code that only that role's own packages use, such as a function two orchestrators use to page through a port's results. Keep a helper unexported in the package that uses it, or put it in a package under an `internal/` directory inside the role's directory, such as `internal/orchestrators/internal/paging` or `cmd/internal/wiring`. Go then lets only packages under `internal/orchestrators/`, or under `cmd/`, import it. Every other package under `orchestrators/` or `adapters/` is a member, which other roles may reach. In `cmd/`, each `main` package is an entrypoint. The core has no helpers.
 
-### Core or shell: who reads the value
+Roles under `internal/` are the module's own. Roles at the module root, outside `internal/`, are for other modules to import too, whether or not the module has a program in `cmd/`. Projects on go-baseline give another module's packages the roles their directories give, so its `core/` counts as core in them too.
+
+### Core or orchestrator: who reads the value
 
 When code needs a value from an outside source, such as the time, a file or an API response:
 
-- **The core takes the value.** The shell reads it through a port and passes it in. A core function takes `now time.Time`, not a `Clock`; core tests pass values, with nothing to fake.
-- **The shell takes the port.** It calls the port, passes the values to the core and acts on what the core returns.
+- **The core takes the value.** The orchestrator reads it through a port and passes it in. A core function takes `now time.Time`, not a `Clock`; core tests pass values, with nothing to fake.
+- **The orchestrator takes the port.** It calls the port, passes the values to the core and acts on what the core returns.
 
-`verify` enforces this. Wherever code outside the core passes the core, or a pure library, a value as an interface, a function, a type argument or a variadic argument, or stores one in a core type's field, the value's concrete type must be pure: the core's own, a pure standard library type such as `*strings.Builder`, or a pure third-party type. A port, an adapter, a closure, a shell type or a slice made outside the core is reported. `error` is exempt. The linters also ban `context` from the core, because a context signals I/O.
+`verify` enforces this. Wherever code outside the core passes the core, or a library's core, a value as an interface, a function, a type argument or a variadic argument, or stores one in a core type's field, the value's concrete type must be pure: the core's own, a pure standard library type such as `*strings.Builder`, or a pure third-party type. A port, an adapter, a closure, an orchestrator's type or a slice made outside the core is reported. `error` is exempt. The linters also ban `context` from the core, because a context signals I/O.
 
-### The shell acts; the core decides
+### The orchestrator acts; the core decides
 
-The shell branches only on what the core returns and on whether an error is nil. A value read through a port (a method of an interface the core doesn't declare, or a call to a function value) goes to the core, and the shell acts on the result:
+An orchestrator branches only on what the core returns and on whether an error is nil. A value read through a port (a method of an interface the core doesn't declare, or a call to a function value) goes to the core, and the orchestrator acts on the result:
 
 ```go
 resp, err := sender.Send(ctx, req)
 if err != nil { // allowed: whether the port failed
 	return fmt.Errorf("sending: %w", err)
 }
-if resp.Status == 429 { ... }     // reported: the shell decides
+if resp.Status == 429 { ... }     // reported: the orchestrator decides
 switch rates.Next(resp).(type) {  // allowed: the core decides
 case rates.Retry:
 	...
 }
 ```
 
-`verify` enforces this. It follows a port's value through anything computed from it outside the core, including `errors.Is`, `len`, a struct or slice it's stored in, and what a call such as `json.Unmarshal` writes through a pointer passed with it. It reports an `if`, `switch` or loop condition that depends on it, a function chosen by it, and passing it to another shell function that branches on it. Ranging over a port's value is allowed: doing the same thing for each element isn't a decision. Neither is which case of a `select` ran. Computing with a port's value without branching, such as sorting it, isn't detected, but belongs in the core too.
+`verify` enforces this. It follows a port's value through anything computed from it outside the core, including `errors.Is`, `len`, a struct or slice it's stored in, and what a call such as `json.Unmarshal` writes through a pointer passed with it. It reports an `if`, `switch` or loop condition that depends on it, a function chosen by it, and passing it to another orchestrator function that branches on it. Ranging over a port's value is allowed: doing the same thing for each element isn't a decision. Neither is which case of a `select` ran. Computing with a port's value without branching, such as sorting it, isn't detected, but belongs in the core too.
 
-A core function earns its place by making a decision its test states. One that only compares its argument with a constant, such as `func IsMissing(err error) bool` or `func TooMany(status int) bool`, moves the shell's `if` into the core without deciding anything. Pass the core the whole value instead, and have it return what to do. When there's more than one thing to do, that's a sum type with a case for each, which the shell switches on: see the retry loop under [Libraries](#libraries).
+A core function earns its place by making a decision its test states. One that only compares its argument with a constant, such as `func IsMissing(err error) bool` or `func TooMany(status int) bool`, moves the orchestrator's `if` into the core without deciding anything. Pass the core the whole value instead, and have it return what to do. When there's more than one thing to do, that's a sum type with a case for each, which the orchestrator switches on: see the retry loop under [Libraries](#libraries).
 
 ### What each role may do
 
-| Rule | Core | Shell | Adapter | Composition root |
-|---|---|---|---|---|
-| I/O packages (`os`, `net`, `database/sql`, `math/rand`, `crypto/rand` and others) | Banned | Banned | Allowed | Allowed |
-| Third-party packages that import an I/O package, at any depth | Banned | Banned | Allowed | Allowed |
-| `context`, `log` | Banned | Allowed; take a `*slog.Logger` rather than logging globally | Allowed | Allowed |
-| The clock (`time.Now`, `time.Sleep` and the like), printing (`fmt.Print*`), the global loggers | Banned | Banned | Allowed | Allowed |
-| Reading configuration: environment variables, flags, `os.Args`, the env adapter | Banned | Banned | Banned | Allowed: read it all here and pass the values in |
-| The module's own packages | Core only | Core and shell | Core and other adapters; not the shell | Anything |
-| Size | Cognitive complexity at most 10 | Cognitive complexity at most 10 | Cognitive complexity at most 10, functions at most 50 lines and 30 statements | Functions at most 50 lines and 30 statements |
+| Rule | Core | Orchestrator | Driving adapter | Driven adapter | Entrypoint |
+|---|---|---|---|---|---|
+| I/O packages (`os`, `net`, `database/sql`, `math/rand`, `crypto/rand` and others) | Banned | Banned | Allowed | Allowed | Allowed |
+| Third-party packages that import an I/O package, at any depth | Banned | Banned | Allowed | Allowed | Allowed |
+| `context`, `log` | Banned | Allowed; take a `*slog.Logger` rather than logging globally | Allowed | Allowed | Allowed |
+| The clock (`time.Now`, `time.Sleep` and the like), printing (`fmt.Print*`), the global loggers | Banned | Banned | Allowed | Allowed | Allowed |
+| Reading configuration: environment variables, flags, `os.Args`, the env adapter | Banned | Banned | Banned | Banned | Allowed: read it all here and pass the values in |
+| The module's own packages | Core only | Core and orchestrators | Anything but driven adapters | Core and other driven adapters | Anything |
+| Size | Cognitive complexity at most 10 | Cognitive complexity at most 10 | Cognitive complexity at most 10, functions at most 50 lines and 30 statements | Cognitive complexity at most 10, functions at most 50 lines and 30 statements | Functions at most 50 lines and 30 statements |
+| Parameters | Never reassigned | Never reassigned | Never reassigned | Never reassigned | Never reassigned |
 
 Test files are exempt from the purity and size rules, so integration tests can use real dependencies.
 
@@ -98,7 +104,7 @@ func For(name string, hour int) string {
 }
 ```
 
-The shell declares the port it needs, gathers inputs through it and calls the core:
+An orchestrator, in `internal/orchestrators/app`, declares the port it needs, gathers inputs through it and calls the core:
 
 ```go
 // Package app greets people.
@@ -109,16 +115,27 @@ type Clock interface {
 	Now() time.Time
 }
 
-// Greet writes the greeting for name, for the time clock gives.
-func Greet(clock Clock, out io.Writer, name string) error {
-	if _, err := fmt.Fprintln(out, greeting.For(name, clock.Now().Hour())); err != nil {
+// Greeter greets people at the time its clock gives.
+type Greeter struct {
+	clock Clock
+	out   io.Writer
+}
+
+// NewGreeter returns a Greeter that reads the time from clock and writes to out.
+func NewGreeter(clock Clock, out io.Writer) Greeter {
+	return Greeter{clock: clock, out: out}
+}
+
+// Greet writes the greeting for name.
+func (g Greeter) Greet(name string) error {
+	if _, err := fmt.Fprintln(g.out, greeting.For(name, g.clock.Now().Hour())); err != nil {
 		return fmt.Errorf("writing the greeting: %w", err)
 	}
 	return nil
 }
 ```
 
-An adapter implements the port, in `internal/adapters/clock`. Prefer a shared adapter from go-adapters when one fits; write your own only for I/O specific to the project:
+A driven adapter implements the port, in `internal/adapters/driven/clock`. Prefer a shared adapter from go-shared-code when one fits; write your own only for I/O specific to the project:
 
 ```go
 // Package clock adapts the system clock to the Clock port.
@@ -131,13 +148,34 @@ type System struct{}
 func (System) Now() time.Time { return time.Now() }
 ```
 
-A command's composition root reads the configuration and wires the adapter in:
+A driving adapter turns the command line into a call to the orchestrator, in `internal/adapters/driving/cli`:
+
+```go
+// Package cli is the greet command's command line.
+package cli
+
+// Run greets the name args holds.
+func Run(g app.Greeter, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: greet <name>")
+	}
+	return g.Greet(args[0])
+}
+```
+
+The entrypoint reads the configuration, builds the adapters and orchestrators, and starts the driving adapter. It calls nothing else:
 
 ```go
 // Command greet greets the name it's given.
 package main
 
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "greet: %v\n%s", r, debug.Stack())
+			os.Exit(1)
+		}
+	}()
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "greet:", err)
 		os.Exit(1)
@@ -145,14 +183,11 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: greet <name>")
-	}
-	return app.Greet(clock.System{}, os.Stdout, args[0])
+	return cli.Run(app.NewGreeter(clock.System{}, os.Stdout), args)
 }
 ```
 
-Tests of the shell use a fake for each port:
+Tests of an orchestrator use a fake for each port:
 
 ```go
 type fixedClock struct{ now time.Time }
@@ -160,23 +195,18 @@ type fixedClock struct{ now time.Time }
 func (c fixedClock) Now() time.Time { return c.now }
 ```
 
-## Inbound adapters
+## Driving adapters
 
-The adapters above are driven: the shell calls them through its ports. An HTTP server, a queue consumer or a command-line framework drives the program instead: it calls in. It's still an adapter, since it does I/O, and adapters can't import the shell, so it declares the interface it calls, in the core's types. The shell satisfies it without importing the adapter, and `cmd/` passes one to the other.
+An HTTP server, a queue consumer or a command-line framework drives the program: it calls in. It's a driving adapter, in `internal/adapters/driving/`, and it calls the orchestrator directly, since that call already points inward. It never reaches a driven adapter: a use case's reads and writes all go through an orchestrator's ports, where tests can fake them.
 
-The adapter only translates: it reads the request into bytes, lets the core parse and validate them, calls the shell and writes the result:
+The adapter only translates: it reads the request into bytes, lets the core parse and validate them, calls the orchestrator and writes the result:
 
 ```go
 // Package httpapi serves the orders API over HTTP.
 package httpapi
 
-// Orders is what the API calls to place an order.
-type Orders interface {
-	Place(ctx context.Context, order orders.Order) (orders.Receipt, error)
-}
-
-// Handler returns the API's handler, which places orders through o.
-func Handler(o Orders) http.Handler {
+// Handler returns the API's handler, which places orders through shop.
+func Handler(shop app.Shop) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /orders", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -189,19 +219,25 @@ func Handler(o Orders) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		receipt, err := o.Place(r.Context(), order) // the shell acts
+		receipt, err := shop.Place(r.Context(), order) // the orchestrator acts
 		if err != nil {
 			http.Error(w, "placing the order", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(receipt)
+		_ = json.NewEncoder(w).Encode(receiptJSON{ID: receipt.ID(), TotalPence: receipt.TotalPence()})
 	})
 	return mux
 }
+
+// receiptJSON is a receipt as the API writes it.
+type receiptJSON struct {
+	ID         int64 `json:"id"`
+	TotalPence int64 `json:"total_pence"`
+}
 ```
 
-The adapter reads the body itself rather than passing `r.Body` to the core, because the core takes values, not a reader that does I/O. `cmd/` wires the shell into it:
+The adapter reads the body itself rather than passing `r.Body` to the core, because the core takes values, not a reader that does I/O. It writes the receipt through a type of its own, because a core type's fields are unexported (see [Core types](#core-types)), so `encoding/json` can't see them, and because the API's field names are the adapter's business. `cmd/` builds the orchestrator, hands it to the adapter and starts the server:
 
 ```go
 shop := app.NewShop(store)
@@ -214,57 +250,66 @@ return nil
 
 ## Databases
 
-Declare a port for what the shell stores and looks up, named in the domain's terms, and put the SQL in the adapter that implements it. The shell and core see only the core's types:
+Declare a port for what the orchestrator stores and looks up, named in the domain's terms, and put the SQL in the driven adapter that implements it. The orchestrator and core see only the core's types:
 
 ```go
 // Orders is the port for stored orders.
 type Orders interface {
-	// ByID returns the order with id, and whether there is one.
-	ByID(ctx context.Context, id int64) (order orders.Order, found bool, err error)
+	// ByID returns the order with id, or nil if there is none.
+	ByID(ctx context.Context, id int64) (*orders.Order, error)
 }
 ```
 
-The adapter runs the query and translates: each column into a field, and "no such row" into `found` rather than an error:
+The adapter runs the query and translates: the columns into locals, which the core's factory function builds an order from, and "no such row" into `nil` rather than an error:
 
 ```go
 // ByID looks up the order with id.
-func (s Store) ByID(ctx context.Context, id int64) (orders.Order, bool, error) {
-	var o orders.Order
+func (s Store) ByID(ctx context.Context, id int64) (*orders.Order, error) {
+	var (
+		customer   string
+		totalPence int64
+		placedAt   time.Time
+	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, customer, total_pence, placed_at FROM orders WHERE id = $1`, id,
-	).Scan(&o.ID, &o.Customer, &o.TotalPence, &o.PlacedAt)
+		`SELECT customer, total_pence, placed_at FROM orders WHERE id = $1`, id,
+	).Scan(&customer, &totalPence, &placedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return orders.Order{}, false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return orders.Order{}, false, fmt.Errorf("loading order %d: %w", id, err)
+		return nil, fmt.Errorf("loading order %d: %w", id, err)
 	}
-	return o, true, nil
+	order, err := orders.FromRow(id, customer, totalPence, placedAt)
+	if err != nil {
+		return nil, fmt.Errorf("loading order %d: %w", id, err)
+	}
+	return &order, nil
 }
 ```
 
-The shell passes both to the core, which decides what a missing order means:
+The orchestrator passes the result to the core, which decides what a missing order means:
 
 ```go
-order, found, err := store.ByID(ctx, id)
+order, err := store.ByID(ctx, id)
 if err != nil {
-	return orders.Reply{}, fmt.Errorf("showing order %d: %w", id, err)
+	return nil, fmt.Errorf("showing order %d: %w", id, err)
 }
-return orders.Show(order, found), nil
+reply := orders.Show(order)
+return &reply, nil
 ```
 
-Return concrete values from a port, not an interface such as a sum type: `verify` can't tell what's behind an interface the shell passes to the core. A fake of the port is a map, and the adapter's integration test runs its queries against a real database.
+Return concrete values from a port, not an interface such as a sum type: `verify` can't tell what's behind an interface the orchestrator passes to the core. A fake of the port is a map, and the adapter's integration test runs its queries against a real database.
 
-Use go-ports' `sqlmsg` with go-adapters' `sqlquery` only where the core decides the query itself, such as a search over filters the user picks: the core builds a `sqlmsg.Query` and reads the `sqlmsg.Rows` that come back.
+Use go-ports' `sqlmsg` with go-shared-code's `sqlquery` only where the core decides the query itself, such as a search over filters the user picks: the core builds a `sqlmsg.Query` and reads the `sqlmsg.Rows` that come back.
 
 ## Libraries
 
-A library is a `pure-library`: it takes data and returns data, and its caller does the I/O. An API client builds requests and parses responses as `httpmsg` values from go-ports; the caller's shell sends them through its own port, which `cmd/` satisfies with go-adapters' `httpsend`:
+Make a library pure, with only `core/`: it takes data and returns data, and its caller does the I/O. An API client builds requests and parses responses as `httpmsg` values from go-ports; the caller's orchestrator sends them through its own port, which `cmd/` satisfies with go-shared-code's `httpsend`:
 
 ```go
-req := rates.Latest("GBP", "USD")       // pure library builds a value
-resp, err := sender.Send(ctx, req)      // caller's shell, through its port
-rate, err := rates.ParseLatest(resp)    // pure library parses a value
+req := rates.Latest("GBP", "USD")       // library's core builds a value
+resp, err := sender.Send(ctx, req)      // caller's orchestrator, through its port
+rate, err := rates.ParseLatest(resp)    // library's core parses a value
 ```
 
 A flow over several requests, such as paging or retries, stays pure the same way. The library returns the next step as a sum type:
@@ -275,17 +320,37 @@ A flow over several requests, such as paging or retries, stays pure the same way
 //sumtype:decl
 type Step interface{ isStep() }
 
-// Retry is to send Request again after Wait.
+// Retry is to send a request again after a wait.
 type Retry struct {
-	Request httpmsg.Request
-	Wait    time.Duration
+	request httpmsg.Request
+	wait    time.Duration
 }
 
+func newRetry(request httpmsg.Request, wait time.Duration) Retry {
+	return Retry{request: request, wait: wait}
+}
+
+// Request returns the request to send again.
+func (r Retry) Request() httpmsg.Request { return r.request }
+
+// Wait returns how long to wait before sending it.
+func (r Retry) Wait() time.Duration { return r.wait }
+
 // Done holds the rate the response gave.
-type Done struct{ Rate Rate }
+type Done struct{ rate Rate }
+
+func newDone(rate Rate) Done { return Done{rate: rate} }
+
+// Rate returns the rate.
+func (d Done) Rate() Rate { return d.rate }
 
 // Fail holds why the response gave no rate.
-type Fail struct{ Err error }
+type Fail struct{ err error }
+
+func newFail(err error) Fail { return Fail{err: err} }
+
+// Err returns why the response gave no rate.
+func (f Fail) Err() error { return f.err }
 
 func (Retry) isStep() {}
 func (Done) isStep()  {}
@@ -294,37 +359,74 @@ func (Fail) isStep()  {}
 // Next decides what to do with resp, the response to req on attempt, counting from 0.
 func Next(req httpmsg.Request, resp httpmsg.Response, attempt int) Step {
 	if resp.Status == 429 && attempt < 3 {
-		return Retry{Request: req, Wait: time.Duration(attempt+1) * time.Second}
+		return newRetry(req, time.Duration(attempt+1)*time.Second)
 	}
 	rate, err := ParseLatest(resp)
 	if err != nil {
-		return Fail{Err: err}
+		return newFail(err)
 	}
-	return Done{Rate: rate}
+	return newDone(rate)
 }
 ```
 
-The caller's shell is a loop that does what each step says:
+Only `Next` builds a step, so the factory functions are unexported. Export one when another package needs to build the type.
+
+The caller's orchestrator is a loop that does what each step says:
 
 ```go
 for attempt := 0; ; attempt++ {
 	resp, err := sender.Send(ctx, req)
 	if err != nil {
-		return rates.Rate{}, fmt.Errorf("fetching the rate: %w", err)
+		return nil, fmt.Errorf("fetching the rate: %w", err)
 	}
 	switch step := rates.Next(req, resp, attempt).(type) {
 	case rates.Retry:
-		sleeper.Sleep(ctx, step.Wait)
-		req = step.Request
+		sleeper.Sleep(ctx, step.Wait())
+		req = step.Request()
 	case rates.Done:
-		return step.Rate, nil
+		rate := step.Rate()
+		return &rate, nil
 	case rates.Fail:
-		return rates.Rate{}, fmt.Errorf("fetching the rate: %w", step.Err)
+		return nil, fmt.Errorf("fetching the rate: %w", step.Err())
 	}
 }
 ```
 
-I/O shared by several projects goes in an `adapters` module, such as go-adapters, never in a library.
+Give a library orchestrators and adapters only when every caller would otherwise write the same orchestrators around its core. Its orchestrators take driven adapters through the ports they declare, and never build them or read configuration. Its adapters use only the standard library and the library's own packages, so its users don't inherit their dependencies; `verify` reports any other import. An adapter that needs a third-party module goes in a library of only adapters, such as go-shared-code, which may import anything.
+
+## Core types
+
+A struct the core declares keeps its fields unexported, so no other package can set them, and has a getter for each field another package reads, named for the field (`Pence()`, not `GetPence()`). It is built only by factory functions beside it in its package, named for their input (`ParseTotal`, `FromRow`, or `NewX` when there is no invariant to check), each a literal that sets every field from a parameter and does nothing else. A factory function that checks an invariant returns `(T, error)`:
+
+```go
+// Total is an amount of money, never negative.
+type Total struct{ pence int64 }
+
+// ParseTotal returns the total of pence, or ErrNegative.
+func ParseTotal(pence int64) (Total, error) {
+	if pence < 0 {
+		return Total{}, ErrNegative
+	}
+	return Total{pence: pence}, nil
+}
+
+// Pence returns the total in pence.
+func (t Total) Pence() int64 { return t.pence }
+```
+
+Outside its package, code gets a core type's value only from a factory function, or from code that got it from one. It never takes the type's zero value, which skips the factory function's checks: no `T{}`, `&T{}`, `new(T)`, `var t T` or named result of type `T`, and no conversion `T(v)`. That holds beside a failure too, so a function outside the type's package that can fail, or find nothing, returns `*T`, with `nil` for the failure or the absence. A custom analyzer in `verify` is planned to report each of these; until it exists, this is a convention.
+
+## Errors
+
+An expected failure, one a caller could handle, such as a missing record, a conflicting write or invalid input, is a value a function returns. A panic is for a failure no caller could handle, such as a broken invariant, and nothing between the panic and the catch-all where its invocation began recovers it. No check enforces these yet:
+
+- **Core.** Never panic. Return the failure, as `(T, error)` or as a sum type with a case for it. Call the form of a function that returns an error, such as `regexp.Compile` rather than `regexp.MustCompile` on an input. Where a third-party function panics for an expected failure, such as malformed input to a parser, recover in a small function around that one call and return the failure as a value.
+- **Ports.** Each port method returns every expected failure an implementation can meet in its result: `nil` for something missing, as `Orders.ByID` does under [Databases](#databases), or a type the core declares, such as a sum type with a case for a conflicting write. Its `error` result is only for failures no caller could handle, such as a lost connection.
+- **Driven adapters.** Turn each expected failure the dependency reports into the port's value at the call, as `ByID` turns `sql.ErrNoRows` into `nil`, and wrap and return every other error. Never panic for an expected failure, and never `recover`.
+- **Orchestrators.** Return every expected failure, whether the core decided it or a port returned it, in the result. Never panic, and never `recover`; `defer` for cleanup is fine.
+- **Matching errors.** Outside driven adapters, which match their dependency's errors to convert them, `errors.Is` and `errors.As` name only errors declared in the matching package's own role or in the core. A failure another role acts on is declared in the core, and crosses a port or an orchestrator as a value, so a driving adapter never matches a driven adapter's error or a database driver's.
+- **Driving adapters.** One that starts many invocations, such as an HTTP server or a queue consumer, runs each inside one catch-all in `adapters/driving/`: a deferred function that recovers any panic, logs it with its stack (`debug.Stack()`), reports it to the caller as a failure, such as status 500 or a rejected message, and ends the invocation without retrying it. To a caller outside the operator's control, such as an API's client, it reports no message or stack, only an ID it also logs. `net/http` recovers a handler's panic itself, but only logs it and drops the connection, so wrap the handler. Background work a handler starts gets a catch-all of its own. Nothing else in `adapters/driving/` recovers. A command line's only invocation is the whole run, so it returns its error to the entrypoint.
+- **Entrypoints.** `main` reports the error `run` returns, and any panic that reaches it, to standard error and exits with status 1, as the [example](#examples) does. It can't recover a panic in another goroutine, which is why driving adapters recover each invocation.
 
 ## Conventions
 
@@ -332,5 +434,8 @@ I/O shared by several projects goes in an `adapters` module, such as go-adapters
 - No package-level variables or `init` functions: pass state in.
 - Every exported name has a doc comment, and every package has a package comment.
 - Wrap errors with `%w` and context (`fmt.Errorf("reading %s: %w", name, err)`); compare them with `errors.Is` and `errors.As`.
-- Switches over enums and sum types are exhaustive.
+- A closed family of variants is a sum type: an interface with an unexported marker method, such as `isStep()`, so only its own package can implement it, marked with a `//sumtype:decl` comment. `verify` reports a sealed interface without the comment.
+- Switches over enums and sum types name every case and have no `default` arm, so adding a value or a variant fails the lint at every switch that must handle it. List cases that share a branch in one `case`. `verify` reports a `default` arm in a switch on the module's own enum or sum type.
+- Wire by hand in `cmd/`: construct each adapter and pass it in. The linters ban dependency-injection containers such as fx and dig.
+- No function assigns to one of its parameters, even from a closure; give a derived value its own name. revive's modifies-parameter rule reports it.
 - Tests are in `package foo_test` and use the public API.
