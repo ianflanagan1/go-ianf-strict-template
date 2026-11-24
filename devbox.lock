@@ -7,7 +7,7 @@
     },
     "github:ianflanagan1/coupled-tags-lint/v0.2.0#coupled-tags-lint": {
       "last_modified": "2026-11-12T05:51:58Z",
-      "resolved": "github:ianflanagan1/coupled-tags-lint/8c61bf914ea3fca4fa1a09472ad3cef4a5ec059d?lastModified=1794462718&narHash=sha256-ePxxuatqjYR3x%2FCE3d2yyipJ3UWiEv2o9fHAzxiGTMA%3D#coupled-tags-lint"
+      "resolved": "github:ianflanagan1/coupled-tags-lint/6cdba5ee67a227609dd8dff0ddbea072331e8081?lastModified=1794462718&narHash=sha256-ePxxuatqjYR3x%2FCE3d2yyipJ3UWiEv2o9fHAzxiGTMA%3D#coupled-tags-lint"
     },
     "go-task@3.53.1": {
       "last_modified": "2026-10-28T22:04:29Z",
