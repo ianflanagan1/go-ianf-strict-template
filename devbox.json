@@ -4,7 +4,7 @@
     "go@1.27.3",
     "golangci-lint@2.15.0",
     "go-task@3.53.1",
-    "github:ianflanagan1/coupled-tags-lint/v0.2.0#coupled-tags-lint"
+    "github:ianflanagan1/coupled/v0.3.0#coupled"
   ],
   "env": {
     "GOTOOLCHAIN": "go1.27.4"
